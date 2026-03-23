@@ -115,28 +115,32 @@ class ByteBPETokenizer:
             print(f"Tokenizer trained: {len(self.vocab)} tokens ({total:.1f}s)")
 
     def encode(self, text):
-        """Encode text to token ids."""
+        """Encode text to token ids. Fast: only process merges present in current pairs."""
         tokens = list(text.encode('utf-8'))
-        while True:
+        if not self.merges:
+            return tokens
+
+        while len(tokens) >= 2:
+            # find the highest-priority merge among current adjacent pairs
             best_pair = None
-            best_idx = None
-            best_merge_id = len(self.vocab)  # higher = later merge = lower priority
+            best_id = len(self.vocab)
             for i in range(len(tokens) - 1):
                 pair = (tokens[i], tokens[i + 1])
-                if pair in self.merges:
-                    mid = self.merges[pair]
-                    if mid < best_merge_id:
-                        best_merge_id = mid
-                        best_pair = pair
-                        best_idx = i
+                mid = self.merges.get(pair)
+                if mid is not None and mid < best_id:
+                    best_id = mid
+                    best_pair = pair
+
             if best_pair is None:
                 break
-            # apply the earliest merge everywhere
+
+            # apply this merge everywhere
+            a, b = best_pair
             new_tokens = []
             i = 0
             while i < len(tokens):
-                if i < len(tokens) - 1 and (tokens[i], tokens[i + 1]) == best_pair:
-                    new_tokens.append(self.merges[best_pair])
+                if i < len(tokens) - 1 and tokens[i] == a and tokens[i + 1] == b:
+                    new_tokens.append(best_id)
                     i += 2
                 else:
                     new_tokens.append(tokens[i])

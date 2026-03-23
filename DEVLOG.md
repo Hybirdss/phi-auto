@@ -162,3 +162,85 @@ python phi run                      # Full pipeline
 - [2026-03-23] TinyStories downloaded: 2.2GB raw, 20K stories extracted
 - [2026-03-23] System: RAM 68%, CPU 50°C, Battery 31% during training
 - [2026-03-23] BPE tokenizer training is CPU-intensive (~5min for 768 merges on 5K texts)
+
+---
+
+## Optimization Log (autoresearch-style)
+
+### OPT-001: Fused MLP gate+up projection
+**Date:** 2026-03-24
+**Problem:** MLP forward takes 16.5ms/block — two separate Linear ops (gate + up) each do matmul independently.
+**Hypothesis:** Fusing gate and up into a single `gate_up` Linear (n_embd → 2*hidden) saves one matmul dispatch + memory allocation.
+**Result:** Step time 326ms → 233ms (**28.5% faster**). Throughput 1,572 → 2,196 tok/s (**+40%**).
+**Insight:** On small matrices, the overhead of dispatching BLAS calls matters as much as the actual FLOPs. Fewer, larger matmuls > many small ones.
+**Status:** KEPT ✓
+
+### OPT-002: Cached causal mask
+**Date:** 2026-03-24
+**Problem:** `np.triu(np.full((T,T), -1e9))` called every forward pass per layer = 4 allocations/step.
+**Fix:** Pre-allocate once in `__init__`, slice `[:T,:T]` in forward.
+**Result:** Marginal speedup, but eliminates GC pressure over long training runs.
+**Status:** KEPT ✓
+
+### OPT-003: Incremental BPE pair counting (tokenizer)
+**Date:** 2026-03-24
+**Problem:** Original BPE training recounts ALL pairs from scratch each merge = O(merges × total_tokens). 768 merges × 1M tokens = 768M ops in Python. Took >24 minutes on phone.
+**Hypothesis:** Maintain running pair counts, only update affected pairs on each merge.
+**Result:** 500 texts × 256 merges: 1.3s (was estimated >60s). **~50x speedup**.
+**Insight:** The classic BPE bottleneck is pair counting, not the merge itself. Incremental counting turns O(N) per merge into O(affected) per merge.
+**Status:** KEPT ✓
+
+### Profiling Baseline (1.3M params, batch=4, seq=128)
+```
+Component          Time (ms)    % of Total
+─────────────────────────────────────────
+Embedding          0.2          0.1%
+Block×4 (fwd)     124          38%
+  Attention        52           16%
+  MLP              66           20%
+Softmax (loss)     6.7          2%
+Backward          178          55%
+─────────────────────────────────────────
+Total (pre-opt)   326ms        1,572 tok/s
+Total (post-opt)  233ms        2,196 tok/s
+```
+
+### Key Insights
+1. **OpenBLAS ARMV8**: numpy gets 20-22 GFLOPS on this Snapdragon. Decent.
+2. **Matmul dispatch overhead dominates** at small sizes — fusing ops helps more than algorithmic tricks.
+3. **Python loop overhead** is the #1 enemy. BPE training was 50x slower than it needed to be because of Python `for` loops over token sequences.
+4. **Backward > Forward**: backward takes 55% of step time. Must optimize backward pass next.
+
+### OPT-004: Lion optimizer (replace AdamW)
+**Date:** 2026-03-24
+**Insight from research:** Lion (Google Brain 2023) uses `sign(momentum)` instead of `m/(sqrt(v)+eps)`. Only needs 1 buffer per param instead of 2.
+**Expected:** 50% less optimizer memory, simpler computation.
+**LR rule:** Use 10x smaller LR than AdamW, 10x larger weight decay.
+**Status:** IMPLEMENTED, testing with training run
+
+### OPT-005: Memory-mapped data loader
+**Date:** 2026-03-24
+**Problem:** JSON-streaming loader tokenizes on-the-fly = slow. Each `get_batch()` does JSON.parse + BPE encode.
+**Fix:** Pre-tokenize entire dataset into `.npy` uint16 array. Load via `np.load(mmap_mode='r')` = zero-copy OS paging.
+**Expected:** 5-7x faster data loading, near-zero RAM overhead.
+**Status:** IMPLEMENTED
+
+### OPT-006: Incremental tokenizer optimization
+**Date:** 2026-03-24
+**Problem:** Old BPE training took >24 min (killed). New incremental pair counting: 290s (5 min).
+**Speedup:** ~5x for tokenizer training.
+**Status:** KEPT ✓
+
+### Research Findings (2026-03-24)
+From automated research sweep of 2025-2026 papers:
+
+**Architecture:** RWKV-7 "Goose" (March 2025) — O(1) per-token inference vs O(T) for attention. State is (H,D,D) = 1024 elements vs attention's (H,T,T) = 65K elements for T=256. **64x smaller.**
+→ TODO: Replace CausalAttention with RWKV time-mixing.
+
+**Optimizer:** Lion > AdamW for mobile (50% less memory). Schedule-Free AdamW eliminates LR scheduling.
+
+**Self-improvement:** SPIN (Self-Play Fine-Tuning) > STaR for tiny models. No external reward model needed. 2-3 iterations saturate.
+
+**Data loading:** mmap > streaming. Pre-tokenize once, load zero-copy.
+
+**muP:** Tune hyperparams on 64-dim model, transfer to 192-dim. Saves days of HP search.

@@ -128,9 +128,12 @@ class CausalAttention:
     def __init__(self, config):
         self.n_head = config.n_head
         self.head_dim = config.n_embd // config.n_head
+        self.scale = 1.0 / math.sqrt(self.head_dim)
         self.qkv = Linear(config.n_embd, 3 * config.n_embd)
         self.proj = Linear(config.n_embd, config.n_embd)
         self.rope_cos, self.rope_sin = precompute_rope(config.seq_len, self.head_dim)
+        # pre-allocate causal mask (never recreated)
+        self._causal_mask = np.triu(np.full((config.seq_len, config.seq_len), -1e9, dtype=np.float32), k=1)
         # cached
         self.q = self.k = self.v = self.attn_weights = None
 
@@ -146,18 +149,13 @@ class CausalAttention:
         q = apply_rope(q, self.rope_cos, self.rope_sin)
         k = apply_rope(k, self.rope_cos, self.rope_sin)
 
-        scale = 1.0 / math.sqrt(self.head_dim)
-        attn = (q @ k.transpose(0, 1, 3, 2)) * scale
-
-        # causal mask
-        mask = np.triu(np.full((T, T), -1e9, dtype=np.float32), k=1)
-        attn = attn + mask[None, None, :, :]
+        attn = (q @ k.transpose(0, 1, 3, 2)) * self.scale
+        attn += self._causal_mask[None, None, :T, :T]
         attn = softmax(attn, axis=-1)
 
         self.q, self.k, self.v, self.attn_weights = q, k, v, attn
 
-        out = attn @ v  # (B, n_head, T, head_dim)
-        out = out.transpose(0, 2, 1, 3).reshape(B, T, C)
+        out = (attn @ v).transpose(0, 2, 1, 3).reshape(B, T, C)
         return self.proj.forward(out)
 
     def backward(self, dout):
@@ -189,19 +187,20 @@ class CausalAttention:
 
 
 class MLP:
-    """SiLU-gated MLP."""
+    """SiLU-gated MLP with fused gate+up projection."""
     def __init__(self, config):
         hidden = 4 * config.n_embd
-        self.gate = Linear(config.n_embd, hidden)
-        self.up = Linear(config.n_embd, hidden)
+        self.hidden = hidden
+        # fused gate+up: single matmul instead of two
+        self.gate_up = Linear(config.n_embd, 2 * hidden)
         self.down = Linear(hidden, config.n_embd)
         self.gate_out = None
         self.up_out = None
 
     def forward(self, x):
-        g = self.gate.forward(x)
-        u = self.up.forward(x)
-        # SiLU gate
+        gu = self.gate_up.forward(x)
+        g = gu[..., :self.hidden]
+        u = gu[..., self.hidden:]
         sig_g = 1.0 / (1.0 + np.exp(-np.clip(g, -20, 20)))
         self.gate_out = g
         self.up_out = u
@@ -216,15 +215,13 @@ class MLP:
 
         du = dh * silu_g
         dsilu = dh * u
-        # d(silu(g)) = sig_g + g * sig_g * (1 - sig_g) = sig_g * (1 + g * (1 - sig_g))
         dg = dsilu * sig_g * (1.0 + g * (1.0 - sig_g))
 
-        dx_gate = self.gate.backward(dg)
-        dx_up = self.up.backward(du)
-        return dx_gate + dx_up
+        dgu = np.concatenate([dg, du], axis=-1)
+        return self.gate_up.backward(dgu)
 
     def params(self):
-        return self.gate.params() + self.up.params() + self.down.params()
+        return self.gate_up.params() + self.down.params()
 
 
 class TransformerBlock:

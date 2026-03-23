@@ -15,7 +15,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from src.engine.model import GPT, GPTConfig
 from src.engine.tokenizer import ByteBPETokenizer
+from src.engine.optim import Lion, AdamW as AdamWNew, ScheduleFreeAdamW
 from src.data.loader import DataLoader
+from src.data.mmap_loader import MMapDataLoader, prepare_mmap_data
 from src.data.prepare import prepare_all
 
 # ---------------------------------------------------------------------------
@@ -89,7 +91,7 @@ class AdamW:
             components.extend([
                 block.ln1, block.ln2,
                 block.attn.qkv, block.attn.proj,
-                block.mlp.gate, block.mlp.up, block.mlp.down,
+                block.mlp.gate_up, block.mlp.down,
             ])
         for comp in components:
             if hasattr(comp, grad_attr):
@@ -173,8 +175,7 @@ def collect_param_grads(model):
         _collect(block.ln2)
         _collect(block.attn.qkv)
         _collect(block.attn.proj)
-        _collect(block.mlp.gate)
-        _collect(block.mlp.up)
+        _collect(block.mlp.gate_up)
         _collect(block.mlp.down)
     return pairs
 
@@ -251,14 +252,19 @@ def train(config=None):
     print("=" * 60)
 
     # 1. Data preparation
-    print("\n[1/4] Preparing data...")
+    print("\n[1/5] Preparing data...")
     tokenizer, train_path, val_path = prepare_all(
         vocab_size=config['vocab_size'],
         max_stories=20000
     )
 
-    # 2. Model
-    print("\n[2/4] Building model...")
+    # 2. Pre-tokenize to mmap (one-time cost, massive speedup after)
+    print("\n[2/5] Pre-tokenizing to mmap...")
+    train_mmap = prepare_mmap_data(train_path, tokenizer)
+    val_mmap = prepare_mmap_data(val_path, tokenizer)
+
+    # 3. Model
+    print("\n[3/5] Building model...")
     model_config = GPTConfig(
         vocab_size=config['vocab_size'],
         n_embd=config['n_embd'],
@@ -268,20 +274,37 @@ def train(config=None):
     )
     model = GPT(model_config)
 
-    # 3. Data loaders
-    print("\n[3/4] Setting up data loaders...")
-    train_loader = DataLoader(train_path, tokenizer, config['batch_size'], config['seq_len'])
-    val_loader = DataLoader(val_path, tokenizer, config['batch_size'], config['seq_len'], shuffle=False)
+    # 4. Data loaders (mmap — zero-copy, no runtime tokenization)
+    print("\n[4/5] Setting up mmap data loaders...")
+    train_loader = MMapDataLoader(train_mmap, config['batch_size'], config['seq_len'])
+    val_loader = MMapDataLoader(val_mmap, config['batch_size'], config['seq_len'], shuffle=False)
 
-    # 4. Optimizer
-    optimizer = SimpleAdamW(
-        lr=config['lr'],
-        weight_decay=config['weight_decay'],
-        grad_clip=config['grad_clip'],
-    )
+    # 5. Optimizer (Lion: 50% less memory than AdamW)
+    optim_type = config.get('optimizer', 'lion')
+    if optim_type == 'lion':
+        optimizer = Lion(
+            lr=config.get('lr', 3e-4) * 0.1,  # Lion needs ~10x smaller LR
+            weight_decay=config.get('weight_decay', 0.1) * 10,
+            grad_clip=config['grad_clip'],
+        )
+        print(f"  Optimizer: Lion (lr={optimizer.lr:.1e})")
+    elif optim_type == 'schedule_free':
+        optimizer = ScheduleFreeAdamW(
+            lr=config.get('lr', 3e-4),
+            warmup_steps=config.get('warmup_steps', 50),
+            grad_clip=config['grad_clip'],
+        )
+        print(f"  Optimizer: Schedule-Free AdamW (lr={optimizer.lr:.1e})")
+    else:
+        optimizer = SimpleAdamW(
+            lr=config['lr'],
+            weight_decay=config['weight_decay'],
+            grad_clip=config['grad_clip'],
+        )
+        print(f"  Optimizer: AdamW (lr={optimizer.lr:.1e})")
 
-    # 5. Training loop
-    print(f"\n[4/4] Training for {config['max_steps']} steps...")
+    # 6. Training loop
+    print(f"\n[5/5] Training for {config['max_steps']} steps...")
     print(f"  Effective batch: {config['batch_size'] * config['grad_accum']}")
     print(f"  Time budget: {config['time_budget']}s")
     print()
@@ -293,10 +316,15 @@ def train(config=None):
     for step in range(config['max_steps']):
         t0 = time.time()
 
-        # LR schedule
-        lr = get_lr(step, config['warmup_steps'], config['max_steps'],
-                     config['lr'], config['min_lr'])
-        optimizer.lr = lr
+        # LR schedule (skip for schedule-free optimizers)
+        if not isinstance(optimizer, ScheduleFreeAdamW):
+            lr = get_lr(step, config['warmup_steps'], config['max_steps'],
+                         config['lr'], config['min_lr'])
+            if isinstance(optimizer, Lion):
+                lr *= 0.1  # Lion uses ~10x smaller LR
+            optimizer.lr = lr
+        else:
+            lr = optimizer.lr
 
         # gradient accumulation
         total_loss = 0
