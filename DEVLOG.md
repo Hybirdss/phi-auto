@@ -244,3 +244,12 @@ From automated research sweep of 2025-2026 papers:
 **Data loading:** mmap > streaming. Pre-tokenize once, load zero-copy.
 
 **muP:** Tune hyperparams on 64-dim model, transfer to 192-dim. Saves days of HP search.
+
+### OPT-007: RWKV Time-Mixing (implemented, benchmarked)
+**Date:** 2026-03-24
+**Hypothesis:** RWKV replaces O(T²) attention with O(T) linear recurrence. Should be faster.
+**Result (training):** RWKV 9.8ms vs Attention 6.9ms at seq=128, dim=64. RWKV **0.7x slower** in training.
+**Why:** Python `for t in range(T)` loop in RWKV is slower than numpy's batch matmul for attention. NumPy vectorizes `q @ k.T` into a single BLAS call, while RWKV's recurrence can't be vectorized.
+**Key insight:** RWKV wins at **inference** (O(1) per token vs O(T)), not training speed. For generation-heavy workloads (self-improvement loop), RWKV will be crucial.
+**Decision:** Keep as optional module. Use attention for training, switch to RWKV for generation/self-improvement.
+**Status:** IMPLEMENTED as `src/engine/rwkv_tmix.py`, not default yet
