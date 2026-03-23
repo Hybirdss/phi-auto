@@ -151,9 +151,12 @@ python phi run                      # Full pipeline
 
 ## Experiment Results
 
-| # | Date | Config | val_bpb | RAM (MB) | tok/s | Status | Notes |
+| # | Date | Config | val_bpb | val_loss | tok/s | Status | Notes |
 |---|------|--------|---------|----------|-------|--------|-------|
-| - | - | - | - | - | - | - | Waiting for baseline |
+| 1 | 03-24 | 128d/4L Lion 2Kstep | 7.41 | 6.17 | 1,350 | BASELINE | Loss plateau at 6.2, gibberish output |
+| μ1 | 03-24 | 128d/4L AdamW 300step | 7.66 | 6.37 | 1,600 | micro | AdamW converges 3x faster than Lion |
+| μ2 | 03-24 | 128d/4L Lion 300step | 7.89 | 6.56 | 1,400 | micro | Lion slower convergence |
+| 2 | 03-24 | 192d/6L AdamW 6Kstep | - | - | - | RUNNING | 3.5M params, weight-tied, 1.5 epochs |
 
 ---
 
@@ -253,3 +256,56 @@ From automated research sweep of 2025-2026 papers:
 **Key insight:** RWKV wins at **inference** (O(1) per token vs O(T)), not training speed. For generation-heavy workloads (self-improvement loop), RWKV will be crucial.
 **Decision:** Keep as optional module. Use attention for training, switch to RWKV for generation/self-improvement.
 **Status:** IMPLEMENTED as `src/engine/rwkv_tmix.py`, not default yet
+
+### OPT-008: Heap-based BPE encode (21x faster tokenization)
+**Date:** 2026-03-24
+**Problem:** BPE `encode()` uses O(merges × text_length) algorithm — scans all pairs to find best merge, applies it, repeat. For 768 merges × ~200 bytes per text = 154K ops per text. 19K texts = 2.9B Python loop iterations. Pre-tokenization took **13+ minutes**.
+**Fix:** Replace with heap-based O(N log N) algorithm:
+1. Build doubly-linked list of tokens + min-heap of merge candidates
+2. Pop lowest-rank merge, apply in O(1) via linked list surgery
+3. Add new neighbor pairs to heap
+4. Repeat until heap empty
+**Result:** 19K texts: 13+ min → **37 seconds** (**21x speedup**). 500 texts/sec.
+**Insight:** The BPE encode bottleneck is the O(M) scan per merge to find the best pair. The heap eliminates this entirely — each merge application is O(log N) amortized.
+**Status:** KEPT ✓
+
+### OPT-009: Proper RoPE backward pass
+**Date:** 2026-03-24
+**Problem:** Attention backward skipped RoPE gradients ("approximate" comment). RoPE is a rotation matrix, so gradients were systematically biased by ignoring the rotation inverse.
+**Fix:** Implement `apply_rope_backward()` — applies inverse rotation (negate sin component). This is mathematically exact since rotation matrices are orthogonal: R^(-1) = R^T.
+**Impact:** More accurate gradients → better convergence, especially for position-dependent patterns.
+**Status:** KEPT ✓
+
+### OPT-010: Fix gradient accumulation bug + reduce allocations
+**Date:** 2026-03-24
+**Problem 1:** Grad accum buffers allocated at step 0 BEFORE any backward pass → all gradients are None → empty buffer list → IndexError.
+**Fix:** Allocate after first backward.
+**Problem 2:** Embedding backward allocated `np.zeros_like(self.w)` every call (512KB per call × 2000 steps = 1GB GC pressure).
+**Fix:** Reuse pre-allocated buffer.
+**Status:** KEPT ✓
+
+### OPT-011: Weight tying (lm_head shares embedding)
+**Date:** 2026-03-24
+**Hypothesis:** Share embedding weights with lm_head output projection. Standard practice in GPT-2/LLaMA/Phi.
+**Result:** Saves 131K params (10%). Minimal speed impact at vocab=1024 (matmul sizes unchanged).
+**Bug found & fixed:** TiedLinear accumulated grad into `tok_emb.dw`, but `Embedding.backward()` zeroed it. Fixed with `accumulate=True` flag.
+**Status:** KEPT ✓
+
+### OPT-012: NEON C extension for sgemm (ABANDONED)
+**Date:** 2026-03-24
+**Hypothesis:** Custom NEON 4x4 micro-kernel should beat OpenBLAS for our small matrix sizes.
+**Result:** OpenBLAS is **2.5-4.5x FASTER** than naive NEON sgemm. OpenBLAS has assembly-level NEON kernels with cache-aware blocking. Years of tuning > naive implementation.
+**Key insight:** **Matmul is NOT the bottleneck** on this platform. OpenBLAS gets 20+ GFLOPS on ARM. The bottleneck is Python overhead between operations (array allocation, function calls, GC). To beat this, would need the entire forward+backward in C (= reinventing llm.c).
+**Status:** ABANDONED ✗
+
+### INSIGHT-001: Baseline Analysis (2026-03-24)
+**Baseline result:** 128d/4L (1.3M), Lion, 2000 steps → val_bpb=7.41
+**Problem:** Loss plateaus at 6.2 after ~500 steps. Model generates gibberish.
+**Root causes identified via micro-experiments:**
+1. **Insufficient training length:** 2000 steps = 0.5 epochs. Model only sees 48% of data ONCE.
+2. **Optimizer choice:** AdamW converges 3x faster than Lion for this scale. Lion's sign-based updates lose magnitude info critical for small models.
+3. **Model capacity:** 1.3M params saturates at bpb ~7.5. Both optimizers plateau at same level → capacity limit, not optimizer limit.
+4. **Random baseline:** CE(random, vocab=1024) = ln(1024) = 6.93. Our 6.17 is only 11% better than random.
+
+**Action:** Scale to 192d/6L (3.5M), use AdamW, train 6000 steps (1.5 epochs).
+**Target:** val_bpb < 5.0 (50% better than random). val_bpb < 3.0 for coherent text.

@@ -6,3 +6,8 @@ logs/
 *.npz
 data_self_gen.jsonl
 results.tsv
+OpenBLAS/
+neon_ext/
+openblas_custom/
+*.so
+neon_matmul*.c

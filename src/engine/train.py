@@ -272,18 +272,18 @@ def train(config=None):
         n_layer=config['n_layer'],
         seq_len=config['seq_len'],
     )
-    model = GPT(model_config)
+    model = GPT(model_config, tie_weights=config.get('weight_tie', False))
 
     # 4. Data loaders (mmap — zero-copy, no runtime tokenization)
     print("\n[4/5] Setting up mmap data loaders...")
     train_loader = MMapDataLoader(train_mmap, config['batch_size'], config['seq_len'])
     val_loader = MMapDataLoader(val_mmap, config['batch_size'], config['seq_len'], shuffle=False)
 
-    # 5. Optimizer (Lion: 50% less memory than AdamW)
+    # 5. Optimizer
     optim_type = config.get('optimizer', 'lion')
     if optim_type == 'lion':
         optimizer = Lion(
-            lr=config.get('lr', 3e-4) * 0.1,  # Lion needs ~10x smaller LR
+            lr=config.get('lr', 3e-4) * 0.1,
             weight_decay=config.get('weight_decay', 0.1) * 10,
             grad_clip=config['grad_clip'],
         )
@@ -295,13 +295,20 @@ def train(config=None):
             grad_clip=config['grad_clip'],
         )
         print(f"  Optimizer: Schedule-Free AdamW (lr={optimizer.lr:.1e})")
+    elif optim_type == 'adamw':
+        optimizer = AdamWNew(
+            lr=config['lr'],
+            weight_decay=config.get('weight_decay', 0.1),
+            grad_clip=config['grad_clip'],
+        )
+        print(f"  Optimizer: AdamW (lr={optimizer.lr:.1e})")
     else:
         optimizer = SimpleAdamW(
             lr=config['lr'],
             weight_decay=config['weight_decay'],
             grad_clip=config['grad_clip'],
         )
-        print(f"  Optimizer: AdamW (lr={optimizer.lr:.1e})")
+        print(f"  Optimizer: SimpleAdamW (lr={optimizer.lr:.1e})")
 
     # 6. Training loop
     print(f"\n[5/5] Training for {config['max_steps']} steps...")
@@ -326,31 +333,36 @@ def train(config=None):
         else:
             lr = optimizer.lr
 
-        # gradient accumulation
+        # gradient accumulation (pre-allocated buffers, no per-step .copy())
         total_loss = 0
+
         for micro_step in range(config['grad_accum']):
             x, y, epoch = train_loader.get_batch()
             _, loss = model.forward(x, y)
             model.backward()
 
+            pairs = collect_param_grads(model)
+
+            # one-time allocation after first backward (gradients now exist)
+            if step == 0 and micro_step == 0:
+                _accum_bufs = [np.zeros_like(g) for _, g in pairs]
+
             if micro_step == 0:
-                # first micro step: grads are fresh
-                accum_pairs = collect_param_grads(model)
-                accum_grads = [g.copy() for _, g in accum_pairs]
-            else:
-                # accumulate
-                pairs = collect_param_grads(model)
-                for i, (_, g) in enumerate(pairs):
-                    accum_grads[i] += g
+                for buf in _accum_bufs:
+                    buf[:] = 0
+
+            for i, (_, g) in enumerate(pairs):
+                _accum_bufs[i] += g
 
             total_loss += loss
 
-        # average gradients
-        for i in range(len(accum_grads)):
-            accum_grads[i] /= config['grad_accum']
+        # average gradients (in-place)
+        inv_accum = 1.0 / config['grad_accum']
+        for buf in _accum_bufs:
+            buf *= inv_accum
 
         # optimizer step
-        final_pairs = [(p, accum_grads[i]) for i, (p, _) in enumerate(accum_pairs)]
+        final_pairs = [(p, _accum_bufs[i]) for i, (p, _) in enumerate(pairs)]
         optimizer.step(final_pairs)
 
         avg_loss = total_loss / config['grad_accum']

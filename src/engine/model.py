@@ -62,8 +62,11 @@ class Embedding:
         self.indices = idx
         return self.w[idx]
 
-    def backward(self, dout):
-        self.dw = np.zeros_like(self.w)
+    def backward(self, dout, accumulate=False):
+        if self.dw is None:
+            self.dw = np.zeros_like(self.w)
+        elif not accumulate:
+            self.dw[:] = 0
         np.add.at(self.dw, self.indices, dout)
 
     def params(self):
@@ -123,6 +126,17 @@ def apply_rope(x, cos, sin):
     return np.concatenate([x1 * c - x2 * s, x1 * s + x2 * c], axis=-1)
 
 
+def apply_rope_backward(dx, cos, sin):
+    """Backward through RoPE — inverse rotation (negate sin)."""
+    d = dx.shape[-1] // 2
+    dx1, dx2 = dx[..., :d], dx[..., d:]
+    T = dx.shape[2]
+    c = cos[:T][None, None, :, :]
+    s = sin[:T][None, None, :, :]
+    # inverse rotation: transpose of rotation matrix = negate sin
+    return np.concatenate([dx1 * c + dx2 * s, -dx1 * s + dx2 * c], axis=-1)
+
+
 class CausalAttention:
     """Multi-head causal self-attention with RoPE."""
     def __init__(self, config):
@@ -174,7 +188,10 @@ class CausalAttention:
         dq = (dattn @ self.k) * scale
         dk = (dattn.transpose(0, 1, 3, 2) @ self.q) * scale
 
-        # Note: RoPE backward is approximate (skip for simplicity, works well in practice)
+        # RoPE backward: inverse rotation (negate sin)
+        dq = apply_rope_backward(dq, self.rope_cos, self.rope_sin)
+        dk = apply_rope_backward(dk, self.rope_cos, self.rope_sin)
+
         dq = dq.transpose(0, 2, 1, 3).reshape(B, T, C)
         dk = dk.transpose(0, 2, 1, 3).reshape(B, T, C)
         dv = dv.transpose(0, 2, 1, 3).reshape(B, T, C)
@@ -253,19 +270,56 @@ class TransformerBlock:
         return self.ln1.params() + self.attn.params() + self.ln2.params() + self.mlp.params()
 
 
+class TiedLinear:
+    """Linear layer that shares weights with an Embedding (weight tying).
+    Eliminates separate lm_head weight: saves params + speeds up backward.
+    """
+    def __init__(self, embedding):
+        self.emb = embedding  # shared weight: (vocab, dim)
+        self.x = None
+        # no own weight — gradient accumulates into embedding.dw
+
+    def forward(self, x):
+        self.x = x
+        return x @ self.emb.w.T  # (B, T, dim) @ (dim, vocab) -> (B, T, vocab)
+
+    def backward(self, dout):
+        # dout: (B, T, vocab)
+        dx = dout @ self.emb.w  # (B, T, vocab) @ (vocab, dim) -> (B, T, dim)
+        # accumulate weight grad into embedding's dw
+        x_2d = self.x.reshape(-1, self.x.shape[-1])
+        d_2d = dout.reshape(-1, dout.shape[-1])
+        grad = d_2d.T @ x_2d  # (vocab, B*T) @ (B*T, dim) -> (vocab, dim)
+        if self.emb.dw is None:
+            self.emb.dw = grad
+        else:
+            self.emb.dw += grad
+        return dx
+
+    def params(self):
+        return []  # no own params — shared via embedding
+
+
 class GPT:
     """Full GPT model."""
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: GPTConfig, tie_weights=True):
         self.config = config
         self.tok_emb = Embedding(config.vocab_size, config.n_embd)
         self.blocks = [TransformerBlock(config) for _ in range(config.n_layer)]
         self.ln_f = RMSNorm(config.n_embd)
-        self.lm_head = Linear(config.n_embd, config.vocab_size)
+
+        # weight tying: lm_head shares weights with tok_emb (standard practice)
+        self.tie_weights = tie_weights
+        if tie_weights:
+            self.lm_head = TiedLinear(self.tok_emb)
+        else:
+            self.lm_head = Linear(config.n_embd, config.vocab_size)
 
         # count params
         self.n_params = self._count_params()
         print(f"Model: {self.n_params:,} parameters "
-              f"({self.n_params * 4 / 1024 / 1024:.1f} MB fp32)")
+              f"({self.n_params * 4 / 1024 / 1024:.1f} MB fp32)"
+              f"{' (weight-tied)' if tie_weights else ''}")
 
     def _count_params(self):
         total = 0
@@ -320,7 +374,8 @@ class GPT:
         dx = self.ln_f.backward(dx)
         for block in reversed(self.blocks):
             dx = block.backward(dx)
-        self.tok_emb.backward(dx)
+        # when weights are tied, lm_head already wrote to tok_emb.dw — accumulate
+        self.tok_emb.backward(dx, accumulate=self.tie_weights)
 
     def generate(self, idx, max_new_tokens, temperature=0.8, top_k=40):
         """Autoregressive generation."""
