@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+checkpoints/
+logs/
+*.npz
+data_self_gen.jsonl
+results.tsv

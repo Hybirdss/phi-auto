@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""
+phi-auto CLI - Main entrypoint.
+Usage:
+  python phi train           # Phase 1: Train baseline model
+  python phi experiment      # Phase 2: Autonomous experiment loop
+  python phi improve         # Phase 3: Self-improvement loop
+  python phi status          # Show system & training status
+  python phi generate [prompt]  # Generate text from model
+  python phi run             # Full pipeline: train -> experiment -> improve
+"""
+
+import os
+import sys
+import argparse
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
+
+
+def cmd_train(args):
+    """Run baseline training."""
+    from src.engine.train import train
+    from src.tools.config import get_config, merge_configs
+
+    config = get_config(args.config)
+    # CLI overrides
+    overrides = {}
+    if args.dim != 128: overrides['n_embd'] = args.dim
+    if args.heads != 4: overrides['n_head'] = args.heads
+    if args.layers != 4: overrides['n_layer'] = args.layers
+    if args.seq_len != 128: overrides['seq_len'] = args.seq_len
+    if args.batch != 4: overrides['batch_size'] = args.batch
+    if args.lr != 3e-4: overrides['lr'] = args.lr
+    if args.steps != 2000: overrides['max_steps'] = args.steps
+    if args.budget != 1800: overrides['time_budget'] = args.budget
+    config = merge_configs(config, overrides)
+    config['min_lr'] = config['lr'] / 10
+    train(config)
+
+
+def cmd_experiment(args):
+    """Run autonomous experiment loop."""
+    from src.agent.experiment import experiment_loop
+    experiment_loop(
+        total_budget_hours=args.hours,
+        experiment_budget_min=args.exp_min,
+    )
+
+
+def cmd_improve(args):
+    """Run self-improvement loop."""
+    from src.agent.self_improve import self_improve_loop
+    self_improve_loop(
+        n_cycles=args.cycles,
+        samples_per_cycle=args.samples,
+        finetune_steps=args.ft_steps,
+        time_budget=args.budget,
+    )
+
+
+def cmd_status(args):
+    """Show system status."""
+    from src.tools.monitor import get_system_snapshot, format_snapshot, get_cpu_usage
+    from src.tools.logger import ExperimentLogger
+    from src.tools.checkpoint import list_checkpoints
+
+    print("=== phi-auto Status ===\n")
+
+    # system
+    snap = get_system_snapshot()
+    print(f"System: {format_snapshot(snap)}")
+    print(f"CPU usage: {get_cpu_usage(interval=0.3):.1f}%\n")
+
+    # experiments
+    logger = ExperimentLogger()
+    best_exp, best_bpb = logger.get_best_result()
+    results = logger.get_all_results()
+    print(f"Experiments: {len(results)} total")
+    if best_exp:
+        print(f"Best: exp #{best_exp} with val_bpb={best_bpb:.4f}")
+    else:
+        print("Best: no results yet")
+
+    # checkpoints
+    ckpts = list_checkpoints()
+    print(f"\nCheckpoints: {len(ckpts)}")
+    for c in ckpts[:5]:
+        print(f"  {c['file']} ({c['size_mb']} MB)")
+
+
+def cmd_generate(args):
+    """Generate text from model."""
+    import numpy as np
+    from src.engine.model import GPT, GPTConfig
+    from src.engine.tokenizer import ByteBPETokenizer
+    from src.tools.checkpoint import load_model, load_metadata
+
+    tok_path = os.path.expanduser("~/.cache/phi-auto/tokenizer.json")
+    if not os.path.exists(tok_path):
+        print("ERROR: No tokenizer found. Run 'phi train' first.")
+        return
+
+    tokenizer = ByteBPETokenizer.load(tok_path)
+
+    # try to load metadata to get config
+    meta = load_metadata(tag=args.checkpoint)
+    if meta and 'config' in meta:
+        cfg = meta['config']
+        model_config = GPTConfig(**cfg)
+    else:
+        model_config = GPTConfig(vocab_size=1024, n_embd=128, n_head=4, n_layer=4, seq_len=128)
+
+    model = GPT(model_config)
+    if not load_model(model, tag=args.checkpoint):
+        print(f"ERROR: No checkpoint '{args.checkpoint}' found. Run 'phi train' first.")
+        return
+
+    prompt = ' '.join(args.prompt) if args.prompt else "Once upon a time"
+    print(f"Prompt: {prompt}")
+    print(f"---")
+
+    tokens = tokenizer.encode(prompt)
+    idx = np.array([tokens], dtype=np.int32)
+    output = model.generate(idx, max_new_tokens=args.tokens, temperature=args.temp)
+    text = tokenizer.decode(output[0].tolist())
+    print(text)
+
+
+def cmd_run(args):
+    """Full pipeline: train -> experiment -> improve."""
+    print("=" * 60)
+    print("phi-auto FULL PIPELINE")
+    print("=" * 60)
+
+    print("\n[Phase 1] Training baseline...")
+    cmd_train(argparse.Namespace(
+        dim=128, heads=4, layers=4, seq_len=128,
+        batch=4, accum=2, lr=3e-4, steps=1000, budget=1800,
+    ))
+
+    print("\n[Phase 2] Autonomous experiments...")
+    cmd_experiment(argparse.Namespace(hours=2, exp_min=10))
+
+    print("\n[Phase 3] Self-improvement...")
+    cmd_improve(argparse.Namespace(
+        cycles=10, samples=20, ft_steps=50, budget=3600,
+    ))
+
+    print("\n=== Pipeline complete! ===")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="phi-auto: On-device self-improving AI")
+    sub = parser.add_subparsers(dest='command')
+
+    # train
+    p_train = sub.add_parser('train', help='Train baseline model')
+    p_train.add_argument('--config', type=str, default=None, help='Path to TOML config')
+    p_train.add_argument('--dim', type=int, default=128)
+    p_train.add_argument('--heads', type=int, default=4)
+    p_train.add_argument('--layers', type=int, default=4)
+    p_train.add_argument('--seq-len', type=int, default=128)
+    p_train.add_argument('--batch', type=int, default=4)
+    p_train.add_argument('--accum', type=int, default=2)
+    p_train.add_argument('--lr', type=float, default=3e-4)
+    p_train.add_argument('--steps', type=int, default=2000)
+    p_train.add_argument('--budget', type=int, default=1800)
+
+    # experiment
+    p_exp = sub.add_parser('experiment', help='Autonomous experiment loop')
+    p_exp.add_argument('--hours', type=float, default=2)
+    p_exp.add_argument('--exp-min', type=int, default=10)
+
+    # improve
+    p_imp = sub.add_parser('improve', help='Self-improvement loop')
+    p_imp.add_argument('--cycles', type=int, default=10)
+    p_imp.add_argument('--samples', type=int, default=20)
+    p_imp.add_argument('--ft-steps', type=int, default=50)
+    p_imp.add_argument('--budget', type=int, default=3600)
+
+    # status
+    sub.add_parser('status', help='Show system status')
+
+    # generate
+    p_gen = sub.add_parser('generate', help='Generate text')
+    p_gen.add_argument('prompt', nargs='*', default=['Once', 'upon', 'a', 'time'])
+    p_gen.add_argument('--tokens', type=int, default=100)
+    p_gen.add_argument('--temp', type=float, default=0.8)
+    p_gen.add_argument('--checkpoint', default='best')
+
+    # run (full pipeline)
+    sub.add_parser('run', help='Full pipeline: train -> experiment -> improve')
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        return
+
+    commands = {
+        'train': cmd_train,
+        'experiment': cmd_experiment,
+        'improve': cmd_improve,
+        'status': cmd_status,
+        'generate': cmd_generate,
+        'run': cmd_run,
+    }
+    commands[args.command](args)
+
+
+if __name__ == "__main__":
+    main()

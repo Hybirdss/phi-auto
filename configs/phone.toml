@@ -1,0 +1,27 @@
+# phi-auto: Optimized config for phone training
+# ~5M params, sweet spot for Snapdragon ARM + 10GB RAM
+
+[model]
+vocab_size = 2048
+n_embd = 256
+n_head = 8
+n_layer = 8
+seq_len = 256
+
+[training]
+batch_size = 4
+grad_accum = 4
+lr = 3e-4
+min_lr = 1e-5
+warmup_steps = 100
+max_steps = 5000
+eval_interval = 200
+eval_steps = 20
+log_interval = 20
+weight_decay = 0.1
+grad_clip = 1.0
+time_budget = 7200
+
+[experiment]
+total_hours = 8
+per_experiment_min = 15
